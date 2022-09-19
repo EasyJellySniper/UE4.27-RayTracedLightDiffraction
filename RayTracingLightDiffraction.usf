@@ -1,0 +1,200 @@
+﻿// must have includes
+#include "../Common.ush"
+#include "RayTracingCommon.ush"
+#include "RayTracingCustomCommon.ush"
+#include "/Engine/Private/PathTracing/Utilities/PathTracingRandomSequence.ush"
+
+// acceleration structure and output buffer
+#if RAYGENSHADER
+RaytracingAccelerationStructure TLAS;
+RWTexture2D<float4> OutputColor;
+Texture2D<float> SceneDepthTexture;
+Texture2D<float4> GBufferA;
+float DiffractionSampleCount;
+#endif
+
+#if COMPUTE_SHADER
+RWTexture2D<float4> OutputSceneColor;
+Texture2D<float4> LightDiffraction;
+RWTexture2D<float4> HistoryDiffraction;
+Texture2D<float4> InputHistoryDiffraction;
+Texture2D<float> SceneDepthTexture;
+float4 JitterOffsets[16];
+float4x4 UnjitteredPrevWorldToClip;
+#endif
+
+SamplerState BilinearClampedSamplerState;
+
+// Function to convert from Wavelength (nm) to RGB color
+// https://stackoverflow.com/questions/3407942/rgb-values-of-visible-spectrum
+float4 WaveLengthToRGB(float L) // RGB <0,1> <- lambda l <400,700> [nm]
+{
+	float T;
+	float R = 0;
+	float G = 0;
+	float B = 0;
+	float A = 0;
+
+	// R 
+	if ((L>=400.0)&&(L<410.0)) { T=(L-400.0)/(410.0-400.0); R=    +(0.33*T)-(0.20*T*T); A = 1; }
+	else if ((L>=410.0)&&(L<475.0)) { T=(L-410.0)/(475.0-410.0); R=0.14         -(0.13*T*T); A = 1; }
+	else if ((L>=545.0)&&(L<595.0)) { T=(L-545.0)/(595.0-545.0); R=    +(1.98*T)-(     T*T); A = 1; }
+	else if ((L>=595.0)&&(L<650.0)) { T=(L-595.0)/(650.0-595.0); R=0.98+(0.06*T)-(0.40*T*T); A = 1; }
+	else if ((L>=650.0)&&(L<700.0)) { T=(L-650.0)/(700.0-650.0); R=0.65-(0.84*T)+(0.20*T*T); A = 1; }
+
+	// G
+	if ((L>=415.0)&&(L<475.0)) { T=(L-415.0)/(475.0-415.0); G=             +(0.80*T*T); A = 1; }
+	else if ((L>=475.0)&&(L<590.0)) { T=(L-475.0)/(590.0-475.0); G=0.8 +(0.76*T)-(0.80*T*T); A = 1; }
+	else if ((L>=585.0)&&(L<639.0)) { T=(L-585.0)/(639.0-585.0); G=0.84-(0.84*T)           ; A = 1; }
+
+	// B
+	if ((L>=400.0)&&(L<475.0)) { T=(L-400.0)/(475.0-400.0); B=    +(2.20*T)-(1.50*T*T); A = 1; }
+	else if ((L>=475.0)&&(L<560.0)) { T=(L-475.0)/(560.0-475.0); B=0.7 -(     T)+(0.30*T*T); A = 1; }
+	
+	return float4(R, G, B, A);
+}
+
+#if RAYGENSHADER
+
+RAY_TRACING_ENTRY_RAYGEN(LightDiffractionRG)
+{
+	// half-sized ray tracing
+	uint2 PixelCoord = DispatchRaysIndex().xy + View.ViewRectMin.xy * 0.5f;
+	float2 UV = float2(PixelCoord * 2) * View.BufferSizeAndInvSize.zw;
+	OutputColor[PixelCoord] = 0.0f;
+	
+	if (!ForwardLightData.HasDirectionalLight)
+	{
+		// don't do anything if there is no directional light
+		return;
+	}
+	
+	// reconstruct world position from depth
+	float DeviceZ = SceneDepthTexture.SampleLevel(BilinearClampedSamplerState, UV, 0);
+	float3 WorldPosition = ReconstructWorldPositionFromDeviceZ(PixelCoord * 2, DeviceZ);
+
+	// be sure to decode it as it's stored as [0,1]
+	float3 WorldNormal = GBufferA.SampleLevel(BilinearClampedSamplerState, UV, 0).rgb * 2 - 1;
+
+	// check it's face or back to light
+	bool IsFacingLight = dot(ForwardLightData.DirectionalLightDirection, WorldNormal) >= 0;
+	if (!IsFacingLight)
+	{
+		// pointless to trace ray if the surface is back to light
+		return;
+	}
+
+	float4 Result = 0;
+	float MaxSampleWidth = 5;
+	for (uint SampleIndex = 0; SampleIndex < DiffractionSampleCount; SampleIndex++)
+	{
+		// prepare random sequence for the ray
+		RandomSequence RandSequence;
+		RandomSequence_Initialize(RandSequence, PixelCoord, SampleIndex, View.StateFrameIndex, DiffractionSampleCount);
+		float3 RandVec = RandomSequence_GenerateSample3D(RandSequence);
+
+		// setup ray, shoot from surface to light source (give a minor T min to prevent self occlusion)
+		// The DirectionalLightDirection has already been inverted. Which means it's to light vector.
+		RayDesc Ray;
+		
+		// prevent self occlusion by adding a small offset, and give some randomness according to max sample width
+		Ray.Origin = WorldPosition + WorldNormal + RandVec * MaxSampleWidth;
+		Ray.Direction = ForwardLightData.DirectionalLightDirection;
+		Ray.TMin = 0.0f;
+		Ray.TMax = 9999;
+
+		// use material closest hit pay load
+		FPackedMaterialClosestHitPayload Payload = (FPackedMaterialClosestHitPayload)0;
+
+		// set data for use in closest shader
+		Payload.SetPixelCoord(PixelCoord * 2);
+
+		// if a material batch without light diffraction enabled, it needs to be ignored
+		Payload.SetIgnoreTranslucentMaterials();
+
+		TraceRay(
+			TLAS,   // AccelerationStructure
+			RAY_FLAG_NONE,
+			RAY_TRACING_MASK_OPAQUE | RAY_TRACING_MASK_TRANSLUCENT,          // trace for both opaque and translucent
+			RAY_TRACING_SHADER_SLOT_MATERIAL, // RayContributionToHitGroupIndex, defined by UE4
+			RAY_TRACING_NUM_SHADER_SLOTS,     // MultiplierForGeometryContributionToShaderIndex, defined by UE4
+			0,      // MissShaderIndex
+			Ray,    // RayDesc
+			Payload // Payload
+		);
+
+		// is it hitting the primitive with light diffraction data enabled?
+		if (Payload.IsHit() && Payload.PackedCustomData == RAYTRACING_USE_WITH_LIGHT_DIFFRACTION)
+		{
+			float3 HitWorldNormal = Payload.GetWorldNormal();
+
+			// calc angle between the hit normal and diffraction grating normal vector
+			// @TODO: find a proper way to input diffraction grating normal or precalculate the incident angle
+			float IncidentAngle = abs(acosFast(dot(HitWorldNormal, float3(0,0.25f,0.75f))));
+
+			// apply diffraction grating equation
+			// https://www.toppr.com/guides/physics-formulas/diffraction-grating-formula/
+			// nλ = dsin(theta)
+			// where n is repetition(order) of spectrum, theta is incident angle and d is distance between slits
+			// this will calculate output λ and converted to RGB color
+			float N = 1;
+		
+			// input lines per mm, assume it's 1550mm
+			float D = 1.0f / 1550.0f;
+
+			// force wave length being positive and convert to nm
+			float WaveLength = D * sin(IncidentAngle) / N * 1000000.0f;
+
+			// convert to RGB and store it
+			Result += WaveLengthToRGB(WaveLength);
+		}
+	}
+
+	OutputColor[PixelCoord] = Result / DiffractionSampleCount;
+}
+#endif
+
+// for default miss shader in this pass, referring FPackedMaterialClosestHitPayloadMS
+// for default hit shader used in this pass, referring CustomMaterialCHS
+
+#if COMPUTE_SHADER
+// output light diffraction
+[numthreads(8, 8, 1)]
+void OutputLightDiffractionCS(uint3 DTid : SV_DispatchThreadID )
+{
+	float2 UV = float2(DTid.xy) * View.ViewSizeAndInvSize.zw;
+	float4 SceneColor = OutputSceneColor[DTid.xy];
+	float4 Diffraction = LightDiffraction.SampleLevel(BilinearClampedSamplerState, UV, 0);
+	
+	// reconstruct world position from depth
+	float DeviceZ = SceneDepthTexture.SampleLevel(BilinearClampedSamplerState, UV, 0);
+	float3 WorldPosition = ReconstructWorldPositionFromDeviceZ(DTid.xy, DeviceZ);
+	float4 PrevNDCPosition = mul(float4(WorldPosition, 1), UnjitteredPrevWorldToClip);
+	PrevNDCPosition.xy /= PrevNDCPosition.w;
+	PrevNDCPosition.xy = PrevNDCPosition.xy * float2(0.5f, -0.5f) + 0.5f;
+
+	float HistoryAlpha = 0.9f;
+	if (saturate(PrevNDCPosition.x) != PrevNDCPosition.x || saturate(PrevNDCPosition.y) != PrevNDCPosition.y
+		|| length(UV - PrevNDCPosition.xy) > 0.01f)
+	{
+		// don't sample history if uv is out-of-range or the frame is moving too fast
+		HistoryAlpha = 0.0f;
+	}
+
+	// @TODO: Expose history sampling parameters instead of hard-coded
+	float4 PrevDiffraction = 0;
+	if (HistoryAlpha > 0.0f)
+	{
+		for (int Idx = 0; Idx < 8; Idx++)
+		{
+			UV = PrevNDCPosition.xy + float2(JitterOffsets[Idx].x, JitterOffsets[Idx].y) * View.ViewSizeAndInvSize.zw;
+			PrevDiffraction += InputHistoryDiffraction.SampleLevel(BilinearClampedSamplerState, UV, 0);
+		}
+	}
+	PrevDiffraction *= 0.125f;
+	Diffraction = lerp(Diffraction, PrevDiffraction, HistoryAlpha);
+	
+	OutputSceneColor[DTid.xy] = lerp(SceneColor, SceneColor + Diffraction * 0.5f, Diffraction.a > 0);
+	HistoryDiffraction[DTid.xy / 2] = Diffraction;
+}
+#endif
